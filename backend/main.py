@@ -4,15 +4,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader, CSVLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
-from pinecone import Pinecone
 from dotenv import load_dotenv
+import sqlite3
 import tempfile
 import os
 import json
@@ -32,14 +32,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HuggingFace локальные эмбеддинги — размерность 384
-embeddings_model = HuggingFaceEmbeddings(
+embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index_name = os.getenv("PINECONE_INDEX")
-index = pc.Index(index_name)
+vectordb = Chroma(
+    persist_directory="./chroma_db",
+    embedding_function=embeddings
+)
 
 llm = ChatGroq(
     model="llama-3.1-8b-instant",
@@ -61,6 +61,37 @@ Context:
     ("human", "{question}"),
 ])
 
+# SQLite для метаданных и истории
+def get_db():
+    conn = sqlite3.connect("metadata.db")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT UNIQUE NOT NULL,
+            pages INTEGER,
+            chunks INTEGER,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            text TEXT NOT NULL,
+            sources TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
 class QuestionRequest(BaseModel):
     question: str
     history: list = []
@@ -77,54 +108,30 @@ def format_history(raw_history: list):
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    return embeddings_model.embed_documents(texts)
-
-def embed_query(query: str) -> list[float]:
-    return embeddings_model.embed_query(query)
-
 def hybrid_search(question: str) -> list:
-    stats = index.describe_index_stats()
-    if stats.total_vector_count == 0:
+    if vectordb._collection.count() == 0:
         return []
 
-    query_vector = embed_query(question)
-
     # Векторный поиск
-    vector_results = index.query(
-        vector=query_vector,
-        top_k=5,
-        include_metadata=True
-    )
-    vector_docs = [
-        Document(
-            page_content=match.metadata.get("text", ""),
-            metadata={"source": match.metadata.get("source", "unknown")}
-        )
-        for match in vector_results.matches
-    ]
+    vector_docs = vectordb.similarity_search(question, k=5)
 
-    # BM25 keyword поиск
-    all_results = index.query(
-        vector=query_vector,
-        top_k=100,
-        include_metadata=True
-    )
-    all_docs = [
-        Document(
-            page_content=match.metadata.get("text", ""),
-            metadata={"source": match.metadata.get("source", "unknown")}
-        )
-        for match in all_results.matches
-    ]
+    # BM25
+    all_docs_result = vectordb.get()
+    corpus = all_docs_result["documents"]
+    metadatas = all_docs_result["metadatas"]
 
-    if all_docs:
-        corpus = [doc.page_content for doc in all_docs]
+    if corpus:
         tokenized_corpus = [doc.lower().split() for doc in corpus]
         bm25 = BM25Okapi(tokenized_corpus)
         scores = bm25.get_scores(question.lower().split())
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:5]
-        bm25_docs = [all_docs[i] for i in top_indices]
+        bm25_docs = [
+            type('Doc', (), {
+                'page_content': corpus[i],
+                'metadata': metadatas[i]
+            })()
+            for i in top_indices
+        ]
 
         seen = set()
         relevant_docs = []
@@ -195,15 +202,13 @@ async def upload(file: UploadFile):
     if ext not in allowed:
         raise HTTPException(status_code=400, detail=f"Supported formats: {', '.join(allowed)}")
 
-    # Проверяем дубли
-    query_vector = embed_query(file.filename)
-    existing = index.query(
-        vector=query_vector,
-        top_k=1,
-        include_metadata=True,
-        filter={"source": {"$eq": file.filename}}
-    )
-    if existing.matches:
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM documents WHERE filename = ?", (file.filename,)
+    ).fetchone()
+    conn.close()
+
+    if existing:
         raise HTTPException(status_code=400, detail="File already uploaded")
 
     content = await file.read()
@@ -229,67 +234,82 @@ async def upload(file: UploadFile):
     if not chunks:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
 
-    texts = [chunk.page_content for chunk in chunks]
-    batch_size = 50
-    all_embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        all_embeddings.extend(embed_texts(batch))
+    for chunk in chunks:
+        chunk.metadata["source"] = file.filename
 
-    vectors = [
-        {
-            "id": f"{file.filename}-{str(uuid.uuid4())}",
-            "values": all_embeddings[i],
-            "metadata": {
-                "text": chunks[i].page_content,
-                "source": file.filename
-            }
-        }
-        for i in range(len(chunks))
-    ]
-    index.upsert(vectors=vectors)
+    vectordb.add_documents(chunks)
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO documents (filename, pages, chunks) VALUES (?, ?, ?)",
+        (file.filename, len(pages), len(chunks))
+    )
+    conn.commit()
+    conn.close()
 
     return {"message": f"Uploaded {len(pages)} pages, {len(chunks)} chunks"}
 
 @app.get("/documents")
 async def get_documents():
-    stats = index.describe_index_stats()
-    if stats.total_vector_count == 0:
-        return {"documents": []}
-
-    result = index.query(
-        vector=embed_query("document"),
-        top_k=100,
-        include_metadata=True
-    )
-    sources = list(set(
-        match.metadata.get("source", "unknown")
-        for match in result.matches
-    ))
-    return {"documents": sources}
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT filename, pages, chunks, uploaded_at FROM documents ORDER BY uploaded_at DESC"
+    ).fetchall()
+    conn.close()
+    return {"documents": [dict(row) for row in rows]}
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
-    query_vector = embed_query(filename)
-    results = index.query(
-        vector=query_vector,
-        top_k=1000,
-        include_metadata=True,
-        filter={"source": {"$eq": filename}}
-    )
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM documents WHERE filename = ?", (filename,)
+    ).fetchone()
 
-    if not results.matches:
+    if not existing:
+        conn.close()
         raise HTTPException(status_code=404, detail="Document not found")
 
-    ids_to_delete = [match.id for match in results.matches]
-    index.delete(ids=ids_to_delete)
+    result = vectordb.get(where={"source": filename})
+    if result["ids"]:
+        vectordb.delete(ids=result["ids"])
 
-    return {"message": f"Deleted: {filename}, vectors: {len(ids_to_delete)}"}
+    conn.execute("DELETE FROM documents WHERE filename = ?", (filename,))
+    conn.commit()
+    conn.close()
+
+    return {"message": f"Deleted: {filename}"}
+
+@app.get("/history")
+async def get_history():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT role, text, sources, created_at FROM history ORDER BY created_at ASC"
+    ).fetchall()
+    conn.close()
+    return {"history": [dict(row) for row in rows]}
+
+@app.post("/history")
+async def save_message(message: dict):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO history (role, text, sources) VALUES (?, ?, ?)",
+        (message["role"], message["text"], json.dumps(message.get("sources", [])))
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.delete("/history")
+async def clear_history():
+    conn = get_db()
+    conn.execute("DELETE FROM history")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 @app.get("/health")
 async def health():
-    stats = index.describe_index_stats()
     return {
         "status": "ok",
-        "documents_indexed": stats.total_vector_count
+        "documents_indexed": vectordb._collection.count()
     }

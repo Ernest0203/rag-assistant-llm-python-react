@@ -11,10 +11,26 @@ export default function App() {
   const [documents, setDocuments] = useState([])
   const [showDocs, setShowDocs] = useState(false)
   const messagesEndRef = useRef(null)
+  const finalAnswerRef = useRef("")
 
   useEffect(() => {
     fetchDocuments()
+    fetchHistory()
   }, [])
+
+  const fetchHistory = async () => {
+    try {
+      const { data } = await axios.get(`${API_URL}/history`)
+      const messages = data.history.map(msg => ({
+        role: msg.role,
+        text: msg.text,
+        sources: msg.sources ? JSON.parse(msg.sources) : []
+      }))
+      setMessages(messages)
+    } catch (e) {
+      console.error(e)
+    }
+  }
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -32,8 +48,11 @@ export default function App() {
   const handleAsk = async () => {
     if (!question.trim() || loading) return
 
+    finalAnswerRef.current = ""
+
     const userMessage = { role: "user", text: question }
     setMessages(prev => [...prev, userMessage])
+    await axios.post(`${API_URL}/history`, { role: "user", text: question })
     setQuestion("")
     setLoading(true)
 
@@ -46,11 +65,11 @@ export default function App() {
         body: JSON.stringify({ question, history })
       })
 
-      // Добавляем пустое сообщение ассистента — будем наполнять по мере стриминга
       setMessages(prev => [...prev, { role: "assistant", text: "", sources: [] }])
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
+      let finalSources = []
 
       while (true) {
         const { done, value } = await reader.read()
@@ -63,7 +82,7 @@ export default function App() {
           const data = JSON.parse(line.replace("data: ", ""))
 
           if (data.type === "sources") {
-            // Обновляем sources последнего сообщения
+            finalSources = data.sources
             setMessages(prev => {
               const updated = [...prev]
               updated[updated.length - 1].sources = data.sources
@@ -72,7 +91,7 @@ export default function App() {
           }
 
           if (data.type === "token") {
-            // Добавляем токен к последнему сообщению
+            finalAnswerRef.current += data.token
             setMessages(prev => {
               const updated = [...prev]
               updated[updated.length - 1] = {
@@ -84,11 +103,30 @@ export default function App() {
           }
 
           if (data.type === "done") {
+            // Сохраняем финальный ответ после завершения стрима
+            // const finalText = messages[messages.length - 1]?.text || ""
+            // setMessages(prev => {
+            //   const updated = [...prev]
+            //   const lastMsg = updated[updated.length - 1]
+            //   axios.post(`${API_URL}/history`, {
+            //     role: "assistant",
+            //     text: lastMsg.text,
+            //     sources: finalSources
+            //   })
+            //   return updated
+            // })
             setLoading(false)
           }
         }
       }
+
+      await axios.post(`${API_URL}/history`, {
+        role: "assistant",
+        text: finalAnswerRef.current,
+        sources: finalSources
+      })
     } catch (err) {
+      console.error(err)
       setMessages(prev => [...prev, { role: "error", text: "Stream error" }])
       setLoading(false)
     }
@@ -141,6 +179,12 @@ export default function App() {
           <button style={styles.docsBtn} onClick={() => setShowDocs(!showDocs)}>
             📚 Docs ({documents.length})
           </button>
+          <button style={styles.docsBtn} onClick={async () => {
+            await axios.delete(`${API_URL}/history`)
+            setMessages([])
+          }}>
+            🗑️ Clear chat
+          </button>
           <label style={styles.uploadBtn}>
             {uploading ? "Uploading..." : "📎 Upload"}
             <input
@@ -161,8 +205,11 @@ export default function App() {
           )}
           {documents.map((doc, i) => (
             <div key={i} style={styles.docItem}>
-              <span style={styles.docName}>📄 {doc}</span>
-              <button style={styles.deleteBtn} onClick={() => handleDelete(doc)}>🗑️</button>
+              <span style={styles.docName}>📄 {doc.filename}</span>
+              <span style={{fontSize: "11px", color: "#9ca3af", marginLeft: "8px"}}>
+                {doc.pages} pages · {doc.chunks} chunks
+              </span>
+              <button style={styles.deleteBtn} onClick={() => handleDelete(doc.filename)}>🗑️</button>
             </div>
           ))}
         </div>
