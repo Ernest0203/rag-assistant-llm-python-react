@@ -3,14 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
-from langchain_pinecone import PineconeVectorStore
-# from langchain_chroma import Chroma  ← было
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader, CSVLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 from pinecone import Pinecone
 from dotenv import load_dotenv
@@ -29,23 +27,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# было:
-# vectordb = Chroma(
-#     persist_directory="./chroma_db",
-#     embedding_function=embeddings
-# )
-
-# стало — Pinecone облачная БД:
+# Pinecone с Inference API — эмбеддинги в облаке, без torch
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index_name = os.getenv("PINECONE_INDEX")
-vectordb = PineconeVectorStore(
-    index=pc.Index(index_name),
-    embedding=embeddings
-)
+index = pc.Index(index_name)
 
 llm = ChatGroq(
     model="llama-3.1-8b-instant",
@@ -80,17 +65,57 @@ def format_history(raw_history: list):
             messages.append(AIMessage(content=msg["text"]))
     return messages
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Генерируем эмбеддинги через Pinecone Inference API"""
+    result = pc.inference.embed(
+        model="multilingual-e5-large",
+        inputs=texts,
+        parameters={"input_type": "passage"}
+    )
+    return [item.values for item in result]
 
-def hybrid_search(question: str):
-    # Векторный поиск — по смыслу
-    vector_docs = vectordb.similarity_search(question, k=5)
+def embed_query(query: str) -> list[float]:
+    """Эмбеддинг для поискового запроса"""
+    result = pc.inference.embed(
+        model="multilingual-e5-large",
+        inputs=[query],
+        parameters={"input_type": "query"}
+    )
+    return result[0].values
 
-    # BM25 — keyword поиск
-    # было с ChromaDB: all_docs_result = vectordb.get()
-    # стало — грузим через similarity_search с пустым запросом
-    all_docs = vectordb.similarity_search("a", k=100)
+def hybrid_search(question: str) -> list:
+    stats = index.describe_index_stats()
+    if stats.total_vector_count == 0:
+        return []
+
+    # Векторный поиск
+    query_vector = embed_query(question)
+    vector_results = index.query(
+        vector=query_vector,
+        top_k=5,
+        include_metadata=True
+    )
+    vector_docs = [
+        Document(
+            page_content=match.metadata.get("text", ""),
+            metadata={"source": match.metadata.get("source", "unknown")}
+        )
+        for match in vector_results.matches
+    ]
+
+    # BM25 — берём все документы для keyword поиска
+    all_results = index.query(
+        vector=query_vector,
+        top_k=100,
+        include_metadata=True
+    )
+    all_docs = [
+        Document(
+            page_content=match.metadata.get("text", ""),
+            metadata={"source": match.metadata.get("source", "unknown")}
+        )
+        for match in all_results.matches
+    ]
 
     if all_docs:
         corpus = [doc.page_content for doc in all_docs]
@@ -109,6 +134,9 @@ def hybrid_search(question: str):
         return relevant_docs
 
     return vector_docs
+
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
 @app.post("/ask")
 async def ask(request: QuestionRequest):
@@ -169,13 +197,14 @@ async def upload(file: UploadFile):
     if ext not in allowed:
         raise HTTPException(status_code=400, detail=f"Supported formats: {', '.join(allowed)}")
 
-    # было с ChromaDB:
-    # existing = vectordb.get(where={"source": file.filename})
-    # if existing["ids"]: raise HTTPException(...)
-
-    # стало — проверяем через фильтр Pinecone:
-    existing = vectordb.similarity_search("a", k=1, filter={"source": file.filename})
-    if existing:
+    # Проверяем дубли
+    existing = index.query(
+        vector=[0.0] * 1024,
+        top_k=1,
+        include_metadata=True,
+        filter={"source": file.filename}
+    )
+    if existing.matches:
         raise HTTPException(status_code=400, detail="File already uploaded")
 
     content = await file.read()
@@ -196,47 +225,70 @@ async def upload(file: UploadFile):
     pages = loader.load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = splitter.split_documents(pages)
-
-    for chunk in chunks:
-        chunk.metadata["source"] = file.filename
-
-    vectordb.add_documents(chunks)
     os.unlink(tmp_path)
+
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Could not extract text from file")
+
+    # Генерируем эмбеддинги батчами по 50
+    texts = [chunk.page_content for chunk in chunks]
+    batch_size = 50
+    all_embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        all_embeddings.extend(embed_texts(batch))
+
+    # Сохраняем в Pinecone
+    vectors = [
+        {
+            "id": f"{file.filename}-{i}",
+            "values": all_embeddings[i],
+            "metadata": {
+                "text": chunks[i].page_content,
+                "source": file.filename
+            }
+        }
+        for i in range(len(chunks))
+    ]
+    index.upsert(vectors=vectors)
 
     return {"message": f"Uploaded {len(pages)} pages, {len(chunks)} chunks"}
 
 @app.get("/documents")
 async def get_documents():
-    # было с ChromaDB:
-    # result = vectordb.get()
-    # sources = list(set(meta.get("source") for meta in result["metadatas"]))
+    stats = index.describe_index_stats()
+    if stats.total_vector_count == 0:
+        return {"documents": []}
 
-    # стало — через Pinecone:
-    docs = vectordb.similarity_search("a", k=100)
-    sources = list(set(doc.metadata.get("source", "unknown") for doc in docs))
+    # Получаем уникальные источники
+    result = index.query(
+        vector=[0.0] * 1024,
+        top_k=100,
+        include_metadata=True
+    )
+    sources = list(set(
+        match.metadata.get("source", "unknown")
+        for match in result.matches
+    ))
     return {"documents": sources}
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
-    # было с ChromaDB:
-    # result = vectordb.get(where={"source": filename})
-    # vectordb.delete(ids=result["ids"])
-
-    # стало — удаляем через Pinecone API напрямую:
-    existing = vectordb.similarity_search("a", k=1, filter={"source": filename})
-    if not existing:
+    existing = index.query(
+        vector=[0.0] * 1024,
+        top_k=1,
+        include_metadata=True,
+        filter={"source": filename}
+    )
+    if not existing.matches:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    pc.Index(index_name).delete(filter={"source": filename})
+    index.delete(filter={"source": filename})
     return {"message": f"Deleted: {filename}"}
 
 @app.get("/health")
 async def health():
-    # было с ChromaDB:
-    # return {"documents_indexed": vectordb._collection.count()}
-
-    # стало — статистика из Pinecone:
-    stats = pc.Index(index_name).describe_index_stats()
+    stats = index.describe_index_stats()
     return {
         "status": "ok",
         "documents_indexed": stats.total_vector_count
