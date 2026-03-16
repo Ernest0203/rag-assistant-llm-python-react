@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 from rank_bm25 import BM25Okapi
 from pinecone import Pinecone
+from langchain_community.vectorstores import Pinecone as PineconeVectorStore
 from dotenv import load_dotenv
 import tempfile
 import os

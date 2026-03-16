@@ -2,11 +2,9 @@ fastapi
 uvicorn
 langchain
 langchain-groq
-langchain-pinecone
 langchain-community
 langchain-text-splitters
 langchain-core
-langchain-chroma
 pinecone
 sentence-transformers
 pypdf
@@ -16,3 +14,4 @@ python-dotenv
 python-multipart
 requests
 rank-bm25
+numpy
