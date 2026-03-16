@@ -1,22 +1,22 @@
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
-from langchain_chroma import Chroma
+from langchain_pinecone import PineconeVectorStore
+# from langchain_chroma import Chroma  ← было
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader, CSVLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-from langchain_community.retrievers import BM25Retriever
 from rank_bm25 import BM25Okapi
+from pinecone import Pinecone
 from dotenv import load_dotenv
-from fastapi.responses import StreamingResponse
-import json
 import tempfile
 import os
+import json
 
 load_dotenv()
 
@@ -33,9 +33,18 @@ embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-vectordb = Chroma(
-    persist_directory="./chroma_db",
-    embedding_function=embeddings
+# было:
+# vectordb = Chroma(
+#     persist_directory="./chroma_db",
+#     embedding_function=embeddings
+# )
+
+# стало — Pinecone облачная БД:
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index_name = os.getenv("PINECONE_INDEX")
+vectordb = PineconeVectorStore(
+    index=pc.Index(index_name),
+    embedding=embeddings
 )
 
 llm = ChatGroq(
@@ -74,62 +83,43 @@ def format_history(raw_history: list):
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-@app.post("/ask")
-async def ask(request: QuestionRequest):
-    if vectordb._collection.count() == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Database is empty. Please upload documents first."
-        )
+def hybrid_search(question: str):
+    # Векторный поиск — по смыслу
+    vector_docs = vectordb.similarity_search(question, k=5)
 
-    # Получаем релевантные чанки через векторный поиск
-    vector_retriever = vectordb.as_retriever(search_kwargs={"k": 5})
-    vector_docs = vector_retriever.invoke(request.question)
-    
-    # BM25 поиск вручную
-    all_docs_result = vectordb.get()
-    corpus = all_docs_result["documents"]
-    metadatas = all_docs_result["metadatas"]
-    
-    if corpus:
+    # BM25 — keyword поиск
+    # было с ChromaDB: all_docs_result = vectordb.get()
+    # стало — грузим через similarity_search с пустым запросом
+    all_docs = vectordb.similarity_search("a", k=100)
+
+    if all_docs:
+        corpus = [doc.page_content for doc in all_docs]
         tokenized_corpus = [doc.lower().split() for doc in corpus]
         bm25 = BM25Okapi(tokenized_corpus)
-        tokenized_query = request.question.lower().split()
-        scores = bm25.get_scores(tokenized_query)
-        
-        # Берём топ-5 по BM25
+        scores = bm25.get_scores(question.lower().split())
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:5]
-        
-        bm25_docs = []
-        for i in top_indices:
-            bm25_docs.append(
-                type('Doc', (), {
-                    'page_content': corpus[i],
-                    'metadata': metadatas[i]
-                })()
-            )
-        
-        # Объединяем результаты, убираем дубли
+        bm25_docs = [all_docs[i] for i in top_indices]
+
         seen = set()
         relevant_docs = []
         for doc in vector_docs + bm25_docs:
             if doc.page_content not in seen:
                 seen.add(doc.page_content)
                 relevant_docs.append(doc)
-    else:
-        relevant_docs = vector_docs
+        return relevant_docs
 
-    # Собираем citations — уникальные источники
-    sources = list(set(
-        doc.metadata.get("source", "unknown")
-        for doc in relevant_docs
-    ))
+    return vector_docs
 
-    # Формируем контекст
+@app.post("/ask")
+async def ask(request: QuestionRequest):
+    relevant_docs = hybrid_search(request.question)
+    if not relevant_docs:
+        raise HTTPException(status_code=400, detail="Database is empty. Please upload documents first.")
+
+    sources = list(set(doc.metadata.get("source", "unknown") for doc in relevant_docs))
     context = format_docs(relevant_docs)
     history = format_history(request.history)
 
-    # Запускаем LLM
     chain = prompt | llm | StrOutputParser()
     answer = chain.invoke({
         "context": context,
@@ -138,58 +128,21 @@ async def ask(request: QuestionRequest):
         "sources_list": ", ".join(sources)
     })
 
-    return {
-        "answer": answer,
-        "sources": sources  # Citations
-    }
+    return {"answer": answer, "sources": sources}
 
 @app.post("/ask/stream")
 async def ask_stream(request: QuestionRequest):
-    if vectordb._collection.count() == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Database is empty. Please upload documents first."
-        )
+    relevant_docs = hybrid_search(request.question)
+    if not relevant_docs:
+        raise HTTPException(status_code=400, detail="Database is empty. Please upload documents first.")
 
-    # hybrid search
-    vector_retriever = vectordb.as_retriever(search_kwargs={"k": 5})
-    vector_docs = vector_retriever.invoke(request.question)
-
-    all_docs_result = vectordb.get()
-    corpus = all_docs_result["documents"]
-    metadatas = all_docs_result["metadatas"]
-
-    if corpus:
-        tokenized_corpus = [doc.lower().split() for doc in corpus]
-        bm25 = BM25Okapi(tokenized_corpus)
-        tokenized_query = request.question.lower().split()
-        scores = bm25.get_scores(tokenized_query)
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:5]
-        bm25_docs = [
-            type('Doc', (), {'page_content': corpus[i], 'metadata': metadatas[i]})()
-            for i in top_indices
-        ]
-        seen = set()
-        relevant_docs = []
-        for doc in vector_docs + bm25_docs:
-            if doc.page_content not in seen:
-                seen.add(doc.page_content)
-                relevant_docs.append(doc)
-    else:
-        relevant_docs = vector_docs
-
-    sources = list(set(
-        doc.metadata.get("source", "unknown")
-        for doc in relevant_docs
-    ))
+    sources = list(set(doc.metadata.get("source", "unknown") for doc in relevant_docs))
     context = format_docs(relevant_docs)
     history = format_history(request.history)
 
     async def generate():
-        # Сначала отправляем sources
         yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
 
-        # Стримим ответ по чанкам
         chain = prompt | llm
         async for chunk in chain.astream({
             "context": context,
@@ -200,7 +153,6 @@ async def ask_stream(request: QuestionRequest):
             if chunk.content:
                 yield f"data: {json.dumps({'type': 'token', 'token': chunk.content})}\n\n"
 
-        # Сигнал что стрим закончен
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
@@ -217,8 +169,13 @@ async def upload(file: UploadFile):
     if ext not in allowed:
         raise HTTPException(status_code=400, detail=f"Supported formats: {', '.join(allowed)}")
 
-    existing = vectordb.get(where={"source": file.filename})
-    if existing["ids"]:
+    # было с ChromaDB:
+    # existing = vectordb.get(where={"source": file.filename})
+    # if existing["ids"]: raise HTTPException(...)
+
+    # стало — проверяем через фильтр Pinecone:
+    existing = vectordb.similarity_search("a", k=1, filter={"source": file.filename})
+    if existing:
         raise HTTPException(status_code=400, detail="File already uploaded")
 
     content = await file.read()
@@ -250,25 +207,37 @@ async def upload(file: UploadFile):
 
 @app.get("/documents")
 async def get_documents():
-    result = vectordb.get()
-    sources = list(set(
-        meta.get("source", "unknown")
-        for meta in result["metadatas"]
-    ))
+    # было с ChromaDB:
+    # result = vectordb.get()
+    # sources = list(set(meta.get("source") for meta in result["metadatas"]))
+
+    # стало — через Pinecone:
+    docs = vectordb.similarity_search("a", k=100)
+    sources = list(set(doc.metadata.get("source", "unknown") for doc in docs))
     return {"documents": sources}
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
-    result = vectordb.get(where={"source": filename})
-    if not result["ids"]:
+    # было с ChromaDB:
+    # result = vectordb.get(where={"source": filename})
+    # vectordb.delete(ids=result["ids"])
+
+    # стало — удаляем через Pinecone API напрямую:
+    existing = vectordb.similarity_search("a", k=1, filter={"source": filename})
+    if not existing:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    vectordb.delete(ids=result["ids"])
+    pc.Index(index_name).delete(filter={"source": filename})
     return {"message": f"Deleted: {filename}"}
 
 @app.get("/health")
 async def health():
+    # было с ChromaDB:
+    # return {"documents_indexed": vectordb._collection.count()}
+
+    # стало — статистика из Pinecone:
+    stats = pc.Index(index_name).describe_index_stats()
     return {
         "status": "ok",
-        "documents_indexed": vectordb._collection.count()
+        "documents_indexed": stats.total_vector_count
     }
