@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_groq import ChatGroq
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader, CSVLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -31,7 +32,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pinecone с Inference API — эмбеддинги в облаке, без torch
+# HuggingFace локальные эмбеддинги — размерность 384
+embeddings_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index_name = os.getenv("PINECONE_INDEX")
 index = pc.Index(index_name)
@@ -69,31 +74,23 @@ def format_history(raw_history: list):
             messages.append(AIMessage(content=msg["text"]))
     return messages
 
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Генерируем эмбеддинги через Pinecone Inference API"""
-    result = pc.inference.embed(
-        model="multilingual-e5-large",
-        inputs=texts,
-        parameters={"input_type": "passage"}
-    )
-    return [item.values for item in result]
+    return embeddings_model.embed_documents(texts)
 
 def embed_query(query: str) -> list[float]:
-    """Эмбеддинг для поискового запроса"""
-    result = pc.inference.embed(
-        model="multilingual-e5-large",
-        inputs=[query],
-        parameters={"input_type": "query"}
-    )
-    return result[0].values
+    return embeddings_model.embed_query(query)
 
 def hybrid_search(question: str) -> list:
     stats = index.describe_index_stats()
     if stats.total_vector_count == 0:
         return []
 
-    # Векторный поиск
     query_vector = embed_query(question)
+
+    # Векторный поиск
     vector_results = index.query(
         vector=query_vector,
         top_k=5,
@@ -107,7 +104,7 @@ def hybrid_search(question: str) -> list:
         for match in vector_results.matches
     ]
 
-    # BM25 — берём все документы для keyword поиска
+    # BM25 keyword поиск
     all_results = index.query(
         vector=query_vector,
         top_k=100,
@@ -138,9 +135,6 @@ def hybrid_search(question: str) -> list:
         return relevant_docs
 
     return vector_docs
-
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
 
 @app.post("/ask")
 async def ask(request: QuestionRequest):
@@ -201,7 +195,7 @@ async def upload(file: UploadFile):
     if ext not in allowed:
         raise HTTPException(status_code=400, detail=f"Supported formats: {', '.join(allowed)}")
 
-    # Проверяем дубли через поиск
+    # Проверяем дубли
     query_vector = embed_query(file.filename)
     existing = index.query(
         vector=query_vector,
@@ -242,7 +236,6 @@ async def upload(file: UploadFile):
         batch = texts[i:i + batch_size]
         all_embeddings.extend(embed_texts(batch))
 
-    # Уникальные ID через uuid
     vectors = [
         {
             "id": f"{file.filename}-{str(uuid.uuid4())}",
@@ -264,9 +257,8 @@ async def get_documents():
     if stats.total_vector_count == 0:
         return {"documents": []}
 
-    # Получаем уникальные источники
     result = index.query(
-        vector=[0.0] * 1024,
+        vector=embed_query("document"),
         top_k=100,
         include_metadata=True
     )
@@ -278,7 +270,6 @@ async def get_documents():
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
-    # Ищем все векторы этого документа через список всех записей
     query_vector = embed_query(filename)
     results = index.query(
         vector=query_vector,
@@ -290,7 +281,6 @@ async def delete_document(filename: str):
     if not results.matches:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Удаляем по ID
     ids_to_delete = [match.id for match in results.matches]
     index.delete(ids=ids_to_delete)
 
