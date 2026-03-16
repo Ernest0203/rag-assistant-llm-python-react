@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 import tempfile
 import os
 import json
+import uuid
 
 load_dotenv()
 
@@ -200,12 +201,13 @@ async def upload(file: UploadFile):
     if ext not in allowed:
         raise HTTPException(status_code=400, detail=f"Supported formats: {', '.join(allowed)}")
 
-    # Проверяем дубли
+    # Проверяем дубли через поиск
+    query_vector = embed_query(file.filename)
     existing = index.query(
-        vector=[0.0] * 1024,
+        vector=query_vector,
         top_k=1,
         include_metadata=True,
-        filter={"source": file.filename}
+        filter={"source": {"$eq": file.filename}}
     )
     if existing.matches:
         raise HTTPException(status_code=400, detail="File already uploaded")
@@ -233,7 +235,6 @@ async def upload(file: UploadFile):
     if not chunks:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
 
-    # Генерируем эмбеддинги батчами по 50
     texts = [chunk.page_content for chunk in chunks]
     batch_size = 50
     all_embeddings = []
@@ -241,10 +242,10 @@ async def upload(file: UploadFile):
         batch = texts[i:i + batch_size]
         all_embeddings.extend(embed_texts(batch))
 
-    # Сохраняем в Pinecone
+    # Уникальные ID через uuid
     vectors = [
         {
-            "id": f"{file.filename}-{i}",
+            "id": f"{file.filename}-{str(uuid.uuid4())}",
             "values": all_embeddings[i],
             "metadata": {
                 "text": chunks[i].page_content,
@@ -277,17 +278,23 @@ async def get_documents():
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
-    existing = index.query(
-        vector=[0.0] * 1024,
-        top_k=1,
+    # Ищем все векторы этого документа через список всех записей
+    query_vector = embed_query(filename)
+    results = index.query(
+        vector=query_vector,
+        top_k=1000,
         include_metadata=True,
-        filter={"source": filename}
+        filter={"source": {"$eq": filename}}
     )
-    if not existing.matches:
+
+    if not results.matches:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    index.delete(filter={"source": filename})
-    return {"message": f"Deleted: {filename}"}
+    # Удаляем по ID
+    ids_to_delete = [match.id for match in results.matches]
+    index.delete(ids=ids_to_delete)
+
+    return {"message": f"Deleted: {filename}, vectors: {len(ids_to_delete)}"}
 
 @app.get("/health")
 async def health():
