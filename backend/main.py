@@ -13,6 +13,8 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_community.retrievers import BM25Retriever
 from rank_bm25 import BM25Okapi
 from dotenv import load_dotenv
+from fastapi.responses import StreamingResponse
+import json
 import tempfile
 import os
 
@@ -43,8 +45,11 @@ llm = ChatGroq(
 )
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a document assistant. Answer ONLY based on the provided context.
+    ("system", """You are a document assistant. You have access to the following documents: {sources_list}
+
+Answer ONLY based on the provided context chunks below.
 If the answer is not in the context, say: "There is no information on this topic in the documents."
+If the user asks which documents you have access to, list them from the context metadata.
 Answer in the same language as the question.
 
 Context:
@@ -129,13 +134,80 @@ async def ask(request: QuestionRequest):
     answer = chain.invoke({
         "context": context,
         "history": history,
-        "question": request.question
+        "question": request.question,
+        "sources_list": ", ".join(sources)
     })
 
     return {
         "answer": answer,
         "sources": sources  # Citations
     }
+
+@app.post("/ask/stream")
+async def ask_stream(request: QuestionRequest):
+    if vectordb._collection.count() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Database is empty. Please upload documents first."
+        )
+
+    # hybrid search
+    vector_retriever = vectordb.as_retriever(search_kwargs={"k": 5})
+    vector_docs = vector_retriever.invoke(request.question)
+
+    all_docs_result = vectordb.get()
+    corpus = all_docs_result["documents"]
+    metadatas = all_docs_result["metadatas"]
+
+    if corpus:
+        tokenized_corpus = [doc.lower().split() for doc in corpus]
+        bm25 = BM25Okapi(tokenized_corpus)
+        tokenized_query = request.question.lower().split()
+        scores = bm25.get_scores(tokenized_query)
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:5]
+        bm25_docs = [
+            type('Doc', (), {'page_content': corpus[i], 'metadata': metadatas[i]})()
+            for i in top_indices
+        ]
+        seen = set()
+        relevant_docs = []
+        for doc in vector_docs + bm25_docs:
+            if doc.page_content not in seen:
+                seen.add(doc.page_content)
+                relevant_docs.append(doc)
+    else:
+        relevant_docs = vector_docs
+
+    sources = list(set(
+        doc.metadata.get("source", "unknown")
+        for doc in relevant_docs
+    ))
+    context = format_docs(relevant_docs)
+    history = format_history(request.history)
+
+    async def generate():
+        # Сначала отправляем sources
+        yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
+
+        # Стримим ответ по чанкам
+        chain = prompt | llm
+        async for chunk in chain.astream({
+            "context": context,
+            "history": history,
+            "question": request.question,
+            "sources_list": ", ".join(sources)
+        }):
+            if chunk.content:
+                yield f"data: {json.dumps({'type': 'token', 'token': chunk.content})}\n\n"
+
+        # Сигнал что стрим закончен
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
 
 @app.post("/upload")
 async def upload(file: UploadFile):

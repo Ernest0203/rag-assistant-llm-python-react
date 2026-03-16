@@ -33,29 +33,63 @@ export default function App() {
     if (!question.trim() || loading) return
 
     const userMessage = { role: "user", text: question }
-    const updatedMessages = [...messages, userMessage]
-    setMessages(updatedMessages)
+    setMessages(prev => [...prev, userMessage])
     setQuestion("")
     setLoading(true)
 
-    // История только user/assistant сообщений для LLM
     const history = messages.filter(m => m.role === "user" || m.role === "assistant")
 
     try {
-      const { data } = await axios.post(`${API_URL}/ask`, {
-        question,
-        history
+      const response = await fetch(`${API_URL}/ask/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, history })
       })
 
-      setMessages(prev => [...prev, {
-        role: "assistant",
-        text: data.answer,
-        sources: data.sources
-      }])
+      // Добавляем пустое сообщение ассистента — будем наполнять по мере стриминга
+      setMessages(prev => [...prev, { role: "assistant", text: "", sources: [] }])
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        const chunk = decoder.decode(value)
+        const lines = chunk.split("\n").filter(line => line.startsWith("data: "))
+
+        for (const line of lines) {
+          const data = JSON.parse(line.replace("data: ", ""))
+
+          if (data.type === "sources") {
+            // Обновляем sources последнего сообщения
+            setMessages(prev => {
+              const updated = [...prev]
+              updated[updated.length - 1].sources = data.sources
+              return updated
+            })
+          }
+
+          if (data.type === "token") {
+            // Добавляем токен к последнему сообщению
+            setMessages(prev => {
+              const updated = [...prev]
+              updated[updated.length - 1] = {
+                ...updated[updated.length - 1],
+                text: updated[updated.length - 1].text + data.token
+              }
+              return updated
+            })
+          }
+
+          if (data.type === "done") {
+            setLoading(false)
+          }
+        }
+      }
     } catch (err) {
-      const detail = err.response?.data?.detail || "Server error"
-      setMessages(prev => [...prev, { role: "error", text: detail }])
-    } finally {
+      setMessages(prev => [...prev, { role: "error", text: "Stream error" }])
       setLoading(false)
     }
   }
